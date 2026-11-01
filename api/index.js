@@ -1,8 +1,10 @@
 const express = require("express");
 const cors = require("cors");
+const path = require("path");
 const { MongoClient } = require("mongodb");
 
 const app = express();
+app.use('/admin-panel', express.static(path.join(__dirname, '../../admin-panel')));
 
 // Middleware
 app.use(cors({ origin: "*" }));
@@ -341,9 +343,13 @@ app.post(["/admin/licenses", "/api/admin/licenses"], checkAdminAuth, async (req,
 
 app.post(["/admin/license/update", "/api/admin/license/update"], checkAdminAuth, async (req, res) => {
     try {
-        const db = await getDatabase();
         const { license_key, status } = req.body || {};
-        await db.collection("licenses").updateOne({ license_key }, { $set: { status } });
+        if (typeof license_key !== 'string' || !['active', 'inactive', 'revoked'].includes(status)) {
+            return res.status(400).json({ error: 'A license key and valid status are required.' });
+        }
+        const db = await getDatabase();
+        const result = await db.collection("licenses").updateOne({ license_key }, { $set: { status } });
+        if (!result.matchedCount) return res.status(404).json({ error: 'License not found.' });
         return res.json({ success: true });
     } catch (err) {
         return res.status(500).json({ error: err.message });
@@ -352,9 +358,11 @@ app.post(["/admin/license/update", "/api/admin/license/update"], checkAdminAuth,
 
 app.post(["/admin/license/reset-seats", "/api/admin/license/reset-seats"], checkAdminAuth, async (req, res) => {
     try {
-        const db = await getDatabase();
         const { license_key } = req.body || {};
-        await db.collection("licenses").updateOne({ license_key }, { $set: { bound_machines: [] } });
+        if (typeof license_key !== 'string' || !license_key.trim()) return res.status(400).json({ error: 'A license key is required.' });
+        const db = await getDatabase();
+        const result = await db.collection("licenses").updateOne({ license_key }, { $set: { bound_machines: [] } });
+        if (!result.matchedCount) return res.status(404).json({ error: 'License not found.' });
         return res.json({ success: true });
     } catch (err) {
         return res.status(500).json({ error: err.message });
@@ -374,16 +382,23 @@ app.post(["/admin/license/delete", "/api/admin/license/delete"], checkAdminAuth,
 
 app.post(["/admin/license/create", "/api/admin/license/create"], checkAdminAuth, async (req, res) => {
     try {
-        const db = await getDatabase();
         const { plan, owner, email, max_machines, expires_at, notes } = req.body || {};
+        if (!['pro', 'standard', 'trial'].includes(plan) || typeof owner !== 'string' || !owner.trim() ||
+            typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) ||
+            !Number.isInteger(max_machines) || max_machines < 1 || max_machines > 10 ||
+            typeof expires_at !== 'string' || !Number.isFinite(Date.parse(expires_at)) || Date.parse(expires_at) <= Date.now() ||
+            (notes != null && typeof notes !== 'string')) {
+            return res.status(400).json({ error: 'Enter a valid plan, client name, email, future expiry, and 1 to 10 seats.' });
+        }
+        const db = await getDatabase();
         const newKey = generateLicenseKey();
 
         await db.collection("licenses").insertOne({
             license_key: newKey,
             status: "active",
             plan: plan || "pro",
-            owner_name: owner || "Client",
-            owner_email: email || "",
+            owner_name: owner.trim(),
+            owner_email: email.trim(),
             max_machines: parseInt(max_machines, 10) || 2,
             bound_machines: [],
             created_at: new Date(),
@@ -400,11 +415,34 @@ app.post(["/admin/license/create", "/api/admin/license/create"], checkAdminAuth,
 app.post(["/admin/usage", "/api/admin/usage"], checkAdminAuth, async (req, res) => {
     try {
         const db = await getDatabase();
-        const logs = await db.collection("usage_logs").find().sort({ timestamp: -1 }).limit(100).toArray();
+        const { action, machine, date_from, date_to } = req.body || {};
+        const page = Math.max(1, parseInt(req.body?.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.body?.limit, 10) || 50));
+        const query = {};
+        if (typeof action === 'string' && action) query.action = action;
+        if (typeof machine === 'string' && machine) {
+            const pattern = machine.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const users = await db.collection('users').find({ machine_name: { $regex: pattern, $options: 'i' } }).toArray();
+            query.$or = [{ machine_id: { $regex: pattern, $options: 'i' } }, { machine_id: { $in: users.map(u => u.machine_id) } }];
+        }
+        if (date_from || date_to) {
+            query.timestamp = {};
+            for (const [value, operator] of [[date_from, '$gte'], [date_to, '$lte']]) {
+                if (!value) continue;
+                const date = new Date(value);
+                if (!Number.isFinite(date.getTime())) return res.status(400).json({ error: 'Invalid date filter.' });
+                query.timestamp[operator] = date;
+            }
+        }
+        const total = await db.collection('usage_logs').countDocuments(query);
+        const logs = await db.collection("usage_logs").find(query).sort({ timestamp: -1 }).skip((page - 1) * limit).limit(limit).toArray();
+        const machines = await db.collection('users').find({ machine_id: { $in: logs.map(l => l.machine_id) } }).toArray();
+        const names = new Map(machines.map(u => [u.machine_id, u.machine_name]));
         return res.json({
+            total, page, limit,
             logs: logs.map(l => ({
                 timestamp: l.timestamp,
-                machine_name: l.machine_id,
+                machine_name: names.get(l.machine_id) || l.machine_id,
                 license_key: l.license_key,
                 action: l.action,
                 details: JSON.stringify(l.details || {})
@@ -427,8 +465,17 @@ app.post(["/admin/settings", "/api/admin/settings"], checkAdminAuth, async (req,
 
 app.post(["/admin/settings/update", "/api/admin/settings/update"], checkAdminAuth, async (req, res) => {
     try {
-        const db = await getDatabase();
         const { config } = req.body || {};
+        if (!config || typeof config !== 'object' || Array.isArray(config) ||
+            !['maintenance_mode', 'dynamic_routing', 'candid_mode'].every(k => typeof config[k] === 'boolean') ||
+            typeof config.announcement !== 'string' || typeof config.min_plugin_version !== 'string' ||
+            !/^\d+\.\d+\.\d+$/.test(config.min_plugin_version) ||
+            !Number.isInteger(config.jpeg_quality) || config.jpeg_quality < 1 || config.jpeg_quality > 12 ||
+            !Number.isInteger(config.max_batch_size) || config.max_batch_size < 50 || config.max_batch_size > 2000) {
+            return res.status(400).json({ error: 'Enter a valid version, JPEG quality (1–12), and batch size (50–2000).' });
+        }
+        const db = await getDatabase();
+        delete config._id;
         config.updated_at = new Date();
         await db.collection("plugin_config").replaceOne({ _id: "global_config" }, { _id: "global_config", ...config }, { upsert: true });
         return res.json({ success: true });
