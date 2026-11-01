@@ -350,6 +350,28 @@ app.post(["/admin/license/update", "/api/admin/license/update"], checkAdminAuth,
     }
 });
 
+app.post(["/admin/license/reset-seats", "/api/admin/license/reset-seats"], checkAdminAuth, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { license_key } = req.body || {};
+        await db.collection("licenses").updateOne({ license_key }, { $set: { bound_machines: [] } });
+        return res.json({ success: true });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+app.post(["/admin/license/delete", "/api/admin/license/delete"], checkAdminAuth, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { license_key } = req.body || {};
+        await db.collection("licenses").deleteOne({ license_key });
+        return res.json({ success: true });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
 app.post(["/admin/license/create", "/api/admin/license/create"], checkAdminAuth, async (req, res) => {
     try {
         const db = await getDatabase();
