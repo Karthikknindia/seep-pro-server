@@ -9,23 +9,6 @@ app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Vercel path normalization: restore original path from headers if rewritten to /api
-app.use((req, res, next) => {
-    const original = req.headers["x-matched-path"] || req.headers["x-vercel-matched-path"] || req.headers["x-forwarded-uri"];
-    if (original && original !== "/api") {
-        req.url = original;
-    }
-    next();
-});
-
-app.get(["/debug", "/api/debug"], (req, res) => {
-    res.json({
-        url: req.url,
-        path: req.path,
-        headers: req.headers
-    });
-});
-
 const MONGODB_URI = "mongodb+srv://geminikk1997_db_user:l3bsf4VPSPzIqTDp@cluster0.gxqnv0s.mongodb.net/?retryWrites=true&w=majority";
 const ADMIN_SECRET_KEY = "BheemPhoto_Secret_2026!";
 
