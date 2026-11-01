@@ -1,4 +1,13 @@
+const express = require("express");
+const cors = require("cors");
 const { MongoClient } = require("mongodb");
+
+const app = express();
+
+// Middleware
+app.use(cors({ origin: "*" }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const MONGODB_URI = "mongodb+srv://geminikk1997_db_user:l3bsf4VPSPzIqTDp@cluster0.gxqnv0s.mongodb.net/?retryWrites=true&w=majority";
 const ADMIN_SECRET_KEY = "BheemPhoto_Secret_2026!";
@@ -6,46 +15,17 @@ const ADMIN_SECRET_KEY = "BheemPhoto_Secret_2026!";
 let cachedClient = null;
 let cachedDb = null;
 
-async function connectToDatabase() {
+async function getDatabase() {
     if (cachedDb) return cachedDb;
 
-    const client = new MongoClient(MONGODB_URI);
+    const client = new MongoClient(MONGODB_URI, {
+        serverSelectionTimeoutMS: 5000,
+        connectTimeoutMS: 5000
+    });
     await client.connect();
     cachedClient = client;
     cachedDb = client.db("seep_pro");
     return cachedDb;
-}
-
-function sendJson(res, statusCode, data) {
-    res.setHeader("Content-Type", "application/json");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-    res.statusCode = statusCode;
-    res.end(JSON.stringify(data));
-}
-
-function parseBody(req) {
-    if (req.body) {
-        if (typeof req.body === "object") return Promise.resolve(req.body);
-        try {
-            return Promise.resolve(JSON.parse(req.body));
-        } catch (e) {
-            return Promise.resolve({});
-        }
-    }
-    return new Promise((resolve) => {
-        let body = "";
-        req.on("data", chunk => body += chunk);
-        req.on("end", () => {
-            try {
-                resolve(body ? JSON.parse(body) : {});
-            } catch (err) {
-                resolve({});
-            }
-        });
-        req.on("error", () => resolve({}));
-    });
 }
 
 function generateLicenseKey() {
@@ -54,312 +34,390 @@ function generateLicenseKey() {
     return `SEEP-${segment()}-${segment()}-${segment()}-${segment()}`;
 }
 
-module.exports = async (req, res) => {
-    // 1. CORS Preflight
-    if (req.method === "OPTIONS") {
-        res.setHeader("Access-Control-Allow-Origin", "*");
-        res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-        res.statusCode = 204;
-        return res.end();
-    }
+// ==========================================
+// 1. HEALTH CHECK & TEST ROUTES
+// ==========================================
+app.get("/", (req, res) => {
+    res.json({
+        status: "online",
+        service: "SEEP Pro Cloud API",
+        database: "MongoDB Atlas (Cluster0)",
+        version: "2.0.0",
+        message: "Cloud server is live and accepting license requests 24/7!"
+    });
+});
 
-    // 2. Health check / Browser visit
-    const url = (req.url || "").split("?")[0];
-    if (req.method === "GET" && (url === "/" || url === "" || url === "/api")) {
-        return sendJson(res, 200, {
-            status: "online",
-            service: "SEEP Pro Cloud API",
-            database: "MongoDB Atlas (Cluster0)",
-            version: "2.0.0",
-            message: "Cloud server is live and accepting license requests 24/7!"
-        });
-    }
+app.get("/api", (req, res) => {
+    res.json({
+        status: "online",
+        service: "SEEP Pro Cloud API",
+        database: "MongoDB Atlas (Cluster0)",
+        version: "2.0.0",
+        message: "Cloud server is live and accepting license requests 24/7!"
+    });
+});
 
+app.get("/test-db", async (req, res) => {
     try {
-        const db = await connectToDatabase();
-        const data = await parseBody(req);
+        const db = await getDatabase();
+        const licCount = await db.collection("licenses").countDocuments();
+        res.json({ status: "connected", licenses_count: licCount });
+    } catch (err) {
+        res.status(500).json({ status: "error", error: err.message });
+    }
+});
 
-        // Validate License
-        if (url.endsWith("/validateLicense") && req.method === "POST") {
-            const { license_key, machine_id } = data;
-            const config = await db.collection("plugin_config").findOne({ _id: "global_config" });
+// ==========================================
+// 2. PLUGIN ENDPOINTS
+// ==========================================
 
-            if (config && config.maintenance_mode) {
-                return sendJson(res, 200, { valid: false, reason: "maintenance", message: "Server is under maintenance." });
+// Validate License
+app.post(["/validateLicense", "/api/validateLicense"], async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { license_key, machine_id } = req.body || {};
+
+        const config = await db.collection("plugin_config").findOne({ _id: "global_config" });
+        if (config && config.maintenance_mode) {
+            return res.json({ valid: false, reason: "maintenance", message: "Server is under maintenance." });
+        }
+
+        const lic = await db.collection("licenses").findOne({ license_key });
+        if (!lic) {
+            return res.json({ valid: false, message: "Invalid license key." });
+        }
+
+        if (lic.status !== "active") {
+            return res.json({ valid: false, message: `License is ${lic.status}.` });
+        }
+
+        if (lic.expires_at && new Date(lic.expires_at) < new Date()) {
+            await db.collection("licenses").updateOne({ _id: lic._id }, { $set: { status: "expired" } });
+            return res.json({ valid: false, message: "License has expired." });
+        }
+
+        const isBound = lic.bound_machines && lic.bound_machines.some(m => m.machine_id === machine_id);
+        if (!isBound) {
+            return res.json({ valid: false, message: "This machine is not bound to this license." });
+        }
+
+        await db.collection("licenses").updateOne(
+            { license_key, "bound_machines.machine_id": machine_id },
+            { $set: { "bound_machines.$.last_seen": new Date() } }
+        );
+
+        await db.collection("users").updateOne(
+            { machine_id },
+            { $set: { last_seen: new Date() }, $inc: { total_sessions: 1 } },
+            { upsert: false }
+        );
+
+        return res.json({
+            valid: true,
+            status: "active",
+            plan: lic.plan || "standard",
+            config: config || {},
+            message: "License validated successfully."
+        });
+    } catch (err) {
+        return res.status(500).json({ valid: false, error: err.message });
+    }
+});
+
+// Activate License
+app.post(["/activateLicense", "/api/activateLicense"], async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { license_key, machine_id, machine_name, os_info, ps_version, plugin_version } = req.body || {};
+
+        const lic = await db.collection("licenses").findOne({ license_key });
+        if (!lic) {
+            return res.json({ success: false, message: "Invalid license key." });
+        }
+        if (lic.status !== "active") {
+            return res.json({ success: false, message: `License is ${lic.status}.` });
+        }
+        if (lic.expires_at && new Date(lic.expires_at) < new Date()) {
+            return res.json({ success: false, message: "License has expired." });
+        }
+
+        const bound = lic.bound_machines || [];
+        const isAlreadyBound = bound.some(m => m.machine_id === machine_id);
+
+        if (!isAlreadyBound) {
+            const max = lic.max_machines || 2;
+            if (bound.length >= max) {
+                return res.json({ success: false, message: `Seat limit reached (${bound.length}/${max} machines). Contact admin for additional seats.` });
             }
 
-            const lic = await db.collection("licenses").findOne({ license_key });
-            if (!lic) {
-                return sendJson(res, 200, { valid: false, message: "Invalid license key." });
-            }
-
-            if (lic.status !== "active") {
-                return sendJson(res, 200, { valid: false, message: `License is ${lic.status}.` });
-            }
-
-            if (lic.expires_at && new Date(lic.expires_at) < new Date()) {
-                await db.collection("licenses").updateOne({ _id: lic._id }, { $set: { status: "expired" } });
-                return sendJson(res, 200, { valid: false, message: "License has expired." });
-            }
-
-            const isBound = lic.bound_machines && lic.bound_machines.some(m => m.machine_id === machine_id);
-            if (!isBound) {
-                return sendJson(res, 200, { valid: false, message: "This machine is not bound to this license." });
-            }
+            bound.push({
+                machine_id,
+                machine_name: machine_name || "Unknown",
+                os: os_info || "Unknown",
+                ps_version: ps_version || "Unknown",
+                plugin_version: plugin_version || "2.0.0",
+                activated_at: new Date(),
+                last_seen: new Date()
+            });
 
             await db.collection("licenses").updateOne(
-                { license_key, "bound_machines.machine_id": machine_id },
-                { $set: { "bound_machines.$.last_seen": new Date() } }
+                { license_key },
+                { $set: { bound_machines: bound } }
             );
-
-            await db.collection("users").updateOne(
-                { machine_id },
-                { $set: { last_seen: new Date() }, $inc: { total_sessions: 1 } },
-                { upsert: false }
-            );
-
-            return sendJson(res, 200, {
-                valid: true,
-                status: "active",
-                plan: lic.plan || "standard",
-                config: config || {},
-                message: "License validated successfully."
-            });
         }
 
-        // Activate License
-        if (url.endsWith("/activateLicense") && req.method === "POST") {
-            const { license_key, machine_id, machine_name, os_info, ps_version, plugin_version } = data;
-
-            const lic = await db.collection("licenses").findOne({ license_key });
-            if (!lic) {
-                return sendJson(res, 200, { success: false, message: "Invalid license key." });
-            }
-            if (lic.status !== "active") {
-                return sendJson(res, 200, { success: false, message: `License is ${lic.status}.` });
-            }
-            if (lic.expires_at && new Date(lic.expires_at) < new Date()) {
-                return sendJson(res, 200, { success: false, message: "License has expired." });
-            }
-
-            const bound = lic.bound_machines || [];
-            const isAlreadyBound = bound.some(m => m.machine_id === machine_id);
-
-            if (!isAlreadyBound) {
-                const max = lic.max_machines || 2;
-                if (bound.length >= max) {
-                    return sendJson(res, 200, { success: false, message: `Seat limit reached (${bound.length}/${max} machines). Contact admin for additional seats.` });
-                }
-
-                bound.push({
-                    machine_id,
+        await db.collection("users").updateOne(
+            { machine_id },
+            {
+                $set: {
                     machine_name: machine_name || "Unknown",
-                    os: os_info || "Unknown",
+                    os_info: os_info || "Unknown",
                     ps_version: ps_version || "Unknown",
                     plugin_version: plugin_version || "2.0.0",
-                    activated_at: new Date(),
+                    license_key,
                     last_seen: new Date()
-                });
+                },
+                $setOnInsert: {
+                    first_seen: new Date(),
+                    total_sessions: 1,
+                    total_batches_run: 0,
+                    total_photos_placed: 0
+                }
+            },
+            { upsert: true }
+        );
 
-                await db.collection("licenses").updateOne(
-                    { license_key },
-                    { $set: { bound_machines: bound } }
-                );
-            }
+        const config = await db.collection("plugin_config").findOne({ _id: "global_config" });
 
+        return res.json({
+            success: true,
+            message: "Activated successfully!",
+            plan: lic.plan || "standard",
+            config: config || {}
+        });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// Heartbeat
+app.post(["/heartbeat", "/api/heartbeat"], async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { machine_id } = req.body || {};
+        if (machine_id) {
+            await db.collection("users").updateOne({ machine_id }, { $set: { last_seen: new Date() } });
+        }
+        return res.json({ ok: true });
+    } catch (err) {
+        return res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+// Get Config
+app.post(["/getPluginConfig", "/api/getPluginConfig"], async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const config = await db.collection("plugin_config").findOne({ _id: "global_config" });
+        return res.json({ config: config || {} });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// Log Usage
+app.post(["/logUsage", "/api/logUsage"], async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { license_key, machine_id, action, details } = req.body || {};
+        await db.collection("usage_logs").insertOne({
+            license_key,
+            machine_id,
+            action,
+            details: details || {},
+            timestamp: new Date()
+        });
+
+        if (action === "batch_run" && machine_id) {
+            const photos = (details && details.photos_placed) ? details.photos_placed : 0;
             await db.collection("users").updateOne(
                 { machine_id },
-                {
-                    $set: {
-                        machine_name: machine_name || "Unknown",
-                        os_info: os_info || "Unknown",
-                        ps_version: ps_version || "Unknown",
-                        plugin_version: plugin_version || "2.0.0",
-                        license_key,
-                        last_seen: new Date()
-                    },
-                    $setOnInsert: {
-                        first_seen: new Date(),
-                        total_sessions: 1,
-                        total_batches_run: 0,
-                        total_photos_placed: 0
-                    }
-                },
-                { upsert: true }
+                { $inc: { total_batches_run: 1, total_photos_placed: photos } }
             );
-
-            const config = await db.collection("plugin_config").findOne({ _id: "global_config" });
-
-            return sendJson(res, 200, {
-                success: true,
-                message: "Activated successfully!",
-                plan: lic.plan || "standard",
-                config: config || {}
-            });
         }
 
-        // Heartbeat
-        if (url.endsWith("/heartbeat") && req.method === "POST") {
-            const { license_key, machine_id } = data;
-            if (machine_id) {
-                await db.collection("users").updateOne({ machine_id }, { $set: { last_seen: new Date() } });
-            }
-            return sendJson(res, 200, { ok: true });
-        }
-
-        // Get Config
-        if (url.endsWith("/getPluginConfig") && req.method === "POST") {
-            const config = await db.collection("plugin_config").findOne({ _id: "global_config" });
-            return sendJson(res, 200, { config: config || {} });
-        }
-
-        // Log Usage
-        if (url.endsWith("/logUsage") && req.method === "POST") {
-            const { license_key, machine_id, action, details } = data;
-            await db.collection("usage_logs").insertOne({
-                license_key,
-                machine_id,
-                action,
-                details: details || {},
-                timestamp: new Date()
-            });
-
-            if (action === "batch_run" && machine_id) {
-                const photos = (details && details.photos_placed) ? details.photos_placed : 0;
-                await db.collection("users").updateOne(
-                    { machine_id },
-                    { $inc: { total_batches_run: 1, total_photos_placed: photos } }
-                );
-            }
-
-            return sendJson(res, 200, { ok: true });
-        }
-
-        // Admin Endpoints
-        if (url.includes("/admin/")) {
-            if (data.admin_key !== ADMIN_SECRET_KEY) {
-                return sendJson(res, 403, { error: "Invalid Admin Secret Key" });
-            }
-        }
-
-        if (url.endsWith("/admin/dashboard") && req.method === "POST") {
-            const totalUsers = await db.collection("users").countDocuments();
-            const activeLic = await db.collection("licenses").countDocuments({ status: "active" });
-            const inactiveLic = await db.collection("licenses").countDocuments({ status: { $ne: "active" } });
-
-            const photoAgg = await db.collection("users").aggregate([
-                { $group: { _id: null, total: { $sum: "$total_photos_placed" } } }
-            ]).toArray();
-            const totalPhotos = photoAgg[0]?.total || 0;
-
-            const recentLogs = await db.collection("usage_logs").find().sort({ timestamp: -1 }).limit(10).toArray();
-
-            return sendJson(res, 200, {
-                stats: {
-                    total_users: totalUsers,
-                    active_licenses: activeLic,
-                    inactive_licenses: inactiveLic,
-                    total_photos: totalPhotos
-                },
-                recent_activity: recentLogs.map(l => ({
-                    action: l.action,
-                    machine: l.machine_id,
-                    details: JSON.stringify(l.details || {}),
-                    time: l.timestamp
-                }))
-            });
-        }
-
-        if (url.endsWith("/admin/users") && req.method === "POST") {
-            const users = await db.collection("users").find().sort({ last_seen: -1 }).toArray();
-            return sendJson(res, 200, {
-                users: users.map(u => ({
-                    machine_name: u.machine_name || u.machine_id,
-                    os: u.os_info,
-                    ps_version: u.ps_version,
-                    plugin_version: u.plugin_version,
-                    license_key: u.license_key,
-                    last_seen: u.last_seen,
-                    total_sessions: u.total_sessions || 0,
-                    total_batches: u.total_batches_run || 0,
-                    total_photos: u.total_photos_placed || 0
-                }))
-            });
-        }
-
-        if (url.endsWith("/admin/licenses") && req.method === "POST") {
-            const lics = await db.collection("licenses").find().sort({ created_at: -1 }).toArray();
-            return sendJson(res, 200, {
-                licenses: lics.map(l => ({
-                    license_key: l.license_key,
-                    status: l.status,
-                    plan: l.plan,
-                    owner: l.owner_name,
-                    email: l.owner_email,
-                    machines_used: l.bound_machines?.length || 0,
-                    max_machines: l.max_machines || 2,
-                    created_at: l.created_at,
-                    expires_at: l.expires_at
-                }))
-            });
-        }
-
-        if (url.endsWith("/admin/license/update") && req.method === "POST") {
-            const { license_key, status } = data;
-            await db.collection("licenses").updateOne({ license_key }, { $set: { status } });
-            return sendJson(res, 200, { success: true });
-        }
-
-        if (url.endsWith("/admin/license/create") && req.method === "POST") {
-            const { plan, owner, email, max_machines, expires_at, notes } = data;
-            const newKey = generateLicenseKey();
-
-            await db.collection("licenses").insertOne({
-                license_key: newKey,
-                status: "active",
-                plan: plan || "pro",
-                owner_name: owner || "Client",
-                owner_email: email || "",
-                max_machines: parseInt(max_machines, 10) || 2,
-                bound_machines: [],
-                created_at: new Date(),
-                expires_at: expires_at ? new Date(expires_at) : new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
-                notes: notes || ""
-            });
-
-            return sendJson(res, 200, { success: true, license_key: newKey });
-        }
-
-        if (url.endsWith("/admin/usage") && req.method === "POST") {
-            const logs = await db.collection("usage_logs").find().sort({ timestamp: -1 }).limit(100).toArray();
-            return sendJson(res, 200, {
-                logs: logs.map(l => ({
-                    timestamp: l.timestamp,
-                    machine_name: l.machine_id,
-                    license_key: l.license_key,
-                    action: l.action,
-                    details: JSON.stringify(l.details || {})
-                }))
-            });
-        }
-
-        if (url.endsWith("/admin/settings") && req.method === "POST") {
-            const config = await db.collection("plugin_config").findOne({ _id: "global_config" });
-            return sendJson(res, 200, { config: config || {} });
-        }
-
-        if (url.endsWith("/admin/settings/update") && req.method === "POST") {
-            const { config } = data;
-            config.updated_at = new Date();
-            await db.collection("plugin_config").replaceOne({ _id: "global_config" }, { _id: "global_config", ...config }, { upsert: true });
-            return sendJson(res, 200, { success: true });
-        }
-
-        return sendJson(res, 404, { error: "Endpoint not found" });
-
+        return res.json({ ok: true });
     } catch (err) {
-        console.error("Vercel Serverless Error:", err);
-        return sendJson(res, 500, { error: err.message });
+        return res.status(500).json({ ok: false, error: err.message });
     }
+});
+
+// ==========================================
+// 3. ADMIN PANEL ENDPOINTS
+// ==========================================
+
+const checkAdminAuth = (req, res, next) => {
+    const adminKey = req.body?.admin_key || req.headers["authorization"]?.replace("Bearer ", "");
+    if (adminKey !== ADMIN_SECRET_KEY) {
+        return res.status(403).json({ error: "Invalid Admin Secret Key" });
+    }
+    next();
 };
+
+app.post(["/admin/dashboard", "/api/admin/dashboard"], checkAdminAuth, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const totalUsers = await db.collection("users").countDocuments();
+        const activeLic = await db.collection("licenses").countDocuments({ status: "active" });
+        const inactiveLic = await db.collection("licenses").countDocuments({ status: { $ne: "active" } });
+        const photoAgg = await db.collection("users").aggregate([
+            { $group: { _id: null, total: { $sum: "$total_photos_placed" } } }
+        ]).toArray();
+        const totalPhotos = photoAgg[0]?.total || 0;
+        const recentLogs = await db.collection("usage_logs").find().sort({ timestamp: -1 }).limit(10).toArray();
+
+        return res.json({
+            stats: {
+                total_users: totalUsers,
+                active_licenses: activeLic,
+                inactive_licenses: inactiveLic,
+                total_photos: totalPhotos
+            },
+            recent_activity: recentLogs.map(l => ({
+                action: l.action,
+                machine: l.machine_id,
+                details: JSON.stringify(l.details || {}),
+                time: l.timestamp
+            }))
+        });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+app.post(["/admin/users", "/api/admin/users"], checkAdminAuth, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const users = await db.collection("users").find().sort({ last_seen: -1 }).toArray();
+        return res.json({
+            users: users.map(u => ({
+                machine_name: u.machine_name || u.machine_id,
+                os: u.os_info,
+                ps_version: u.ps_version,
+                plugin_version: u.plugin_version,
+                license_key: u.license_key,
+                last_seen: u.last_seen,
+                total_sessions: u.total_sessions || 0,
+                total_batches: u.total_batches_run || 0,
+                total_photos: u.total_photos_placed || 0
+            }))
+        });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+app.post(["/admin/licenses", "/api/admin/licenses"], checkAdminAuth, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const lics = await db.collection("licenses").find().sort({ created_at: -1 }).toArray();
+        return res.json({
+            licenses: lics.map(l => ({
+                license_key: l.license_key,
+                status: l.status,
+                plan: l.plan,
+                owner: l.owner_name,
+                email: l.owner_email,
+                machines_used: l.bound_machines?.length || 0,
+                max_machines: l.max_machines || 2,
+                created_at: l.created_at,
+                expires_at: l.expires_at
+            }))
+        });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+app.post(["/admin/license/update", "/api/admin/license/update"], checkAdminAuth, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { license_key, status } = req.body || {};
+        await db.collection("licenses").updateOne({ license_key }, { $set: { status } });
+        return res.json({ success: true });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+app.post(["/admin/license/create", "/api/admin/license/create"], checkAdminAuth, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { plan, owner, email, max_machines, expires_at, notes } = req.body || {};
+        const newKey = generateLicenseKey();
+
+        await db.collection("licenses").insertOne({
+            license_key: newKey,
+            status: "active",
+            plan: plan || "pro",
+            owner_name: owner || "Client",
+            owner_email: email || "",
+            max_machines: parseInt(max_machines, 10) || 2,
+            bound_machines: [],
+            created_at: new Date(),
+            expires_at: expires_at ? new Date(expires_at) : new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+            notes: notes || ""
+        });
+
+        return res.json({ success: true, license_key: newKey });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+app.post(["/admin/usage", "/api/admin/usage"], checkAdminAuth, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const logs = await db.collection("usage_logs").find().sort({ timestamp: -1 }).limit(100).toArray();
+        return res.json({
+            logs: logs.map(l => ({
+                timestamp: l.timestamp,
+                machine_name: l.machine_id,
+                license_key: l.license_key,
+                action: l.action,
+                details: JSON.stringify(l.details || {})
+            }))
+        });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+app.post(["/admin/settings", "/api/admin/settings"], checkAdminAuth, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const config = await db.collection("plugin_config").findOne({ _id: "global_config" });
+        return res.json({ config: config || {} });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+app.post(["/admin/settings/update", "/api/admin/settings/update"], checkAdminAuth, async (req, res) => {
+    try {
+        const db = await getDatabase();
+        const { config } = req.body || {};
+        config.updated_at = new Date();
+        await db.collection("plugin_config").replaceOne({ _id: "global_config" }, { _id: "global_config", ...config }, { upsert: true });
+        return res.json({ success: true });
+    } catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+});
+
+// Fallback 404
+app.use((req, res) => {
+    res.status(404).json({ error: "Endpoint not found", path: req.path });
+});
+
+module.exports = app;
