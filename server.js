@@ -38,6 +38,14 @@ function sendJson(res, statusCode, data) {
 }
 
 function parseBody(req) {
+    if (req.body) {
+        if (typeof req.body === "object") return Promise.resolve(req.body);
+        try {
+            return Promise.resolve(JSON.parse(req.body));
+        } catch (e) {
+            return Promise.resolve({});
+        }
+    }
     return new Promise((resolve, reject) => {
         let body = "";
         req.on("data", chunk => body += chunk);
