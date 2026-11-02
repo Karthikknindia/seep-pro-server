@@ -8,7 +8,7 @@ app.use('/admin-panel', express.static(path.join(__dirname, '../../admin-panel')
 
 // Middleware
 app.use(cors({ origin: "*" }));
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 const MONGODB_URI = "mongodb+srv://geminikk1997_db_user:l3bsf4VPSPzIqTDp@cluster0.gxqnv0s.mongodb.net/?retryWrites=true&w=majority";
@@ -485,6 +485,10 @@ app.post(["/admin/settings/update", "/api/admin/settings/update"], checkAdminAut
 });
 
 // Fallback 404
+// Decisions run here; the client receives results, never executable source.
+const { handleProcessing } = require('../processing');
+app.post(['/processing', '/api/processing'], (req, res) => handleProcessing(req, res, getDatabase));
+
 app.use((req, res) => {
     res.status(404).json({ error: "Endpoint not found", path: req.path });
 });
