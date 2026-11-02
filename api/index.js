@@ -2,6 +2,8 @@ const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const { MongoClient } = require("mongodb");
+const { randomInt } = require('node:crypto');
+const { handleProcessing, licenseFailure, publicConfig } = require('../processing');
 
 const app = express();
 app.use('/admin-panel', express.static(path.join(__dirname, '../../admin-panel')));
@@ -11,13 +13,14 @@ app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-const MONGODB_URI = "mongodb+srv://geminikk1997_db_user:l3bsf4VPSPzIqTDp@cluster0.gxqnv0s.mongodb.net/?retryWrites=true&w=majority";
-const ADMIN_SECRET_KEY = "BheemPhoto_Secret_2026!";
+const MONGODB_URI = process.env.MONGODB_URI;
+const ADMIN_SECRET_KEY = process.env.ADMIN_SECRET_KEY;
 
 let cachedClient = null;
 let cachedDb = null;
 
 async function getDatabase() {
+    if (!MONGODB_URI) throw new Error('Database is not configured.');
     if (cachedDb) return cachedDb;
 
     const client = new MongoClient(MONGODB_URI, {
@@ -32,7 +35,7 @@ async function getDatabase() {
 
 function generateLicenseKey() {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    const segment = () => Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+    const segment = () => Array.from({ length: 4 }, () => chars[randomInt(chars.length)]).join("");
     return `SEEP-${segment()}-${segment()}-${segment()}-${segment()}`;
 }
 
@@ -59,13 +62,13 @@ app.get("/api", (req, res) => {
     });
 });
 
-app.get("/test-db", async (req, res) => {
+app.get("/test-db", checkAdminAuth, async (req, res) => {
     try {
         const db = await getDatabase();
         const licCount = await db.collection("licenses").countDocuments();
         res.json({ status: "connected", licenses_count: licCount });
     } catch (err) {
-        res.status(500).json({ status: "error", error: err.message });
+        res.status(503).json({ status: "error", error: 'Database service unavailable.' });
     }
 });
 
@@ -74,6 +77,20 @@ app.get("/test-db", async (req, res) => {
 // ==========================================
 
 // Validate License
+// Reject query objects and malformed identifiers before any MongoDB query.
+app.use((req, res, next) => {
+    // Match Express's default case-insensitive and trailing-slash route behavior.
+    const endpoint = req.path.replace(/^\/api\//i, '/').replace(/\/+$/, '').toLowerCase();
+    if (!['/validatelicense', '/activatelicense', '/heartbeat', '/getpluginconfig', '/logusage'].includes(endpoint)) return next();
+    res.set('Cache-Control', 'no-store');
+    const { license_key, machine_id } = req.body || {};
+    const validString = (s, max) => typeof s === 'string' && s.trim().length > 0 && s.length <= max;
+    if (!validString(license_key, 100) || (endpoint !== '/getpluginconfig' && !validString(machine_id, 200))) {
+        return res.status(400).json({ valid: false, success: false, ok: false, message: 'Valid license and device identifiers required.' });
+    }
+    next();
+});
+
 app.post(["/validateLicense", "/api/validateLicense"], async (req, res) => {
     try {
         const db = await getDatabase();
@@ -93,12 +110,12 @@ app.post(["/validateLicense", "/api/validateLicense"], async (req, res) => {
             return res.json({ valid: false, message: `License is ${lic.status}.` });
         }
 
-        if (lic.expires_at && new Date(lic.expires_at) < new Date()) {
+        if (lic.expires_at && (!Number.isFinite(new Date(lic.expires_at).getTime()) || new Date(lic.expires_at) <= new Date())) {
             await db.collection("licenses").updateOne({ _id: lic._id }, { $set: { status: "expired" } });
             return res.json({ valid: false, message: "License has expired." });
         }
 
-        const isBound = lic.bound_machines && lic.bound_machines.some(m => m.machine_id === machine_id);
+        const isBound = Array.isArray(lic.bound_machines) && lic.bound_machines.some(m => m && m.machine_id === machine_id);
         if (!isBound) {
             return res.json({ valid: false, message: "This machine is not bound to this license." });
         }
@@ -118,11 +135,11 @@ app.post(["/validateLicense", "/api/validateLicense"], async (req, res) => {
             valid: true,
             status: "active",
             plan: lic.plan || "standard",
-            config: config || {},
+            config: publicConfig(config || {}),
             message: "License validated successfully."
         });
     } catch (err) {
-        return res.status(500).json({ valid: false, error: err.message });
+        return res.status(503).json({ valid: false, message: 'License service unavailable.' });
     }
 });
 
@@ -131,6 +148,9 @@ app.post(["/activateLicense", "/api/activateLicense"], async (req, res) => {
     try {
         const db = await getDatabase();
         const { license_key, machine_id, machine_name, os_info, ps_version, plugin_version } = req.body || {};
+        if ([machine_name, os_info, ps_version, plugin_version].some(v => v != null && (typeof v !== 'string' || v.length > 200))) return res.status(400).json({ success: false, message: 'Invalid device metadata.' });
+        const config = await db.collection('plugin_config').findOne({ _id: 'global_config' });
+        if (config && config.maintenance_mode) return res.json({ success: false, message: 'Server is under maintenance.' });
 
         const lic = await db.collection("licenses").findOne({ license_key });
         if (!lic) {
@@ -139,11 +159,11 @@ app.post(["/activateLicense", "/api/activateLicense"], async (req, res) => {
         if (lic.status !== "active") {
             return res.json({ success: false, message: `License is ${lic.status}.` });
         }
-        if (lic.expires_at && new Date(lic.expires_at) < new Date()) {
+        if (lic.expires_at && (!Number.isFinite(new Date(lic.expires_at).getTime()) || new Date(lic.expires_at) <= new Date())) {
             return res.json({ success: false, message: "License has expired." });
         }
 
-        const bound = lic.bound_machines || [];
+        const bound = Array.isArray(lic.bound_machines) ? [...lic.bound_machines] : [];
         const isAlreadyBound = bound.some(m => m.machine_id === machine_id);
 
         if (!isAlreadyBound) {
@@ -162,10 +182,13 @@ app.post(["/activateLicense", "/api/activateLicense"], async (req, res) => {
                 last_seen: new Date()
             });
 
-            await db.collection("licenses").updateOne(
-                { license_key },
+            // Compare-and-swap prevents concurrent activations from overwriting seats.
+            const claimed = await db.collection("licenses").updateOne(
+                { license_key, status: 'active', expires_at: lic.expires_at === undefined ? { $exists: false } : lic.expires_at,
+                    bound_machines: lic.bound_machines === undefined ? { $exists: false } : lic.bound_machines },
                 { $set: { bound_machines: bound } }
             );
+            if (!claimed.matchedCount) return res.json({ success: false, message: 'License changed during activation. Please retry.' });
         }
 
         await db.collection("users").updateOne(
@@ -189,16 +212,14 @@ app.post(["/activateLicense", "/api/activateLicense"], async (req, res) => {
             { upsert: true }
         );
 
-        const config = await db.collection("plugin_config").findOne({ _id: "global_config" });
-
         return res.json({
             success: true,
             message: "Activated successfully!",
             plan: lic.plan || "standard",
-            config: config || {}
+            config: publicConfig(config || {})
         });
     } catch (err) {
-        return res.status(500).json({ success: false, error: err.message });
+        return res.status(503).json({ success: false, message: 'Activation service unavailable.' });
     }
 });
 
@@ -206,13 +227,18 @@ app.post(["/activateLicense", "/api/activateLicense"], async (req, res) => {
 app.post(["/heartbeat", "/api/heartbeat"], async (req, res) => {
     try {
         const db = await getDatabase();
-        const { machine_id } = req.body || {};
+        const { license_key, machine_id } = req.body || {};
+        const license = await db.collection('licenses').findOne({ license_key });
+        const failure = licenseFailure(license, machine_id);
+        if (failure) return res.json({ ok: false, message: failure });
+        const config = await db.collection('plugin_config').findOne({ _id: 'global_config' });
+        if (config && config.maintenance_mode) return res.json({ ok: false, message: 'Server is under maintenance.' });
         if (machine_id) {
-            await db.collection("users").updateOne({ machine_id }, { $set: { last_seen: new Date() } });
+            await db.collection("users").updateOne({ machine_id, license_key }, { $set: { last_seen: new Date() } });
         }
         return res.json({ ok: true });
     } catch (err) {
-        return res.status(500).json({ ok: false, error: err.message });
+        return res.status(503).json({ ok: false, message: 'Heartbeat service unavailable.' });
     }
 });
 
@@ -220,10 +246,12 @@ app.post(["/heartbeat", "/api/heartbeat"], async (req, res) => {
 app.post(["/getPluginConfig", "/api/getPluginConfig"], async (req, res) => {
     try {
         const db = await getDatabase();
+        const license = await db.collection('licenses').findOne({ license_key: req.body.license_key });
+        if (licenseFailure(license)) return res.status(403).json({ message: 'Active license required.' });
         const config = await db.collection("plugin_config").findOne({ _id: "global_config" });
-        return res.json({ config: config || {} });
+        return res.json({ config: publicConfig(config || {}) });
     } catch (err) {
-        return res.status(500).json({ error: err.message });
+        return res.status(503).json({ error: 'Configuration service unavailable.' });
     }
 });
 
@@ -232,6 +260,9 @@ app.post(["/logUsage", "/api/logUsage"], async (req, res) => {
     try {
         const db = await getDatabase();
         const { license_key, machine_id, action, details } = req.body || {};
+        if (licenseFailure(await db.collection('licenses').findOne({ license_key }), machine_id)) return res.status(403).json({ ok: false, message: 'Active bound license required.' });
+        if (!['plugin_open', 'license_activated', 'dry_run', 'batch_run'].includes(action) ||
+            (details != null && (typeof details !== 'object' || Array.isArray(details)))) return res.status(400).json({ ok: false, message: 'Invalid usage event.' });
         await db.collection("usage_logs").insertOne({
             license_key,
             machine_id,
@@ -250,7 +281,7 @@ app.post(["/logUsage", "/api/logUsage"], async (req, res) => {
 
         return res.json({ ok: true });
     } catch (err) {
-        return res.status(500).json({ ok: false, error: err.message });
+        return res.status(503).json({ ok: false, message: 'Usage service unavailable.' });
     }
 });
 
@@ -258,9 +289,9 @@ app.post(["/logUsage", "/api/logUsage"], async (req, res) => {
 // 3. ADMIN PANEL ENDPOINTS
 // ==========================================
 
-const checkAdminAuth = (req, res, next) => {
+function checkAdminAuth(req, res, next) {
     const adminKey = req.body?.admin_key || req.headers["authorization"]?.replace("Bearer ", "");
-    if (adminKey !== ADMIN_SECRET_KEY) {
+    if (!ADMIN_SECRET_KEY || typeof adminKey !== 'string' || adminKey !== ADMIN_SECRET_KEY) {
         return res.status(403).json({ error: "Invalid Admin Secret Key" });
     }
     next();
@@ -486,11 +517,16 @@ app.post(["/admin/settings/update", "/api/admin/settings/update"], checkAdminAut
 
 // Fallback 404
 // Decisions run here; the client receives results, never executable source.
-const { handleProcessing } = require('../processing');
 app.post(['/processing', '/api/processing'], (req, res) => handleProcessing(req, res, getDatabase));
 
 app.use((req, res) => {
     res.status(404).json({ error: "Endpoint not found", path: req.path });
+});
+
+// Do not echo parser bodies or database/transport errors into public responses.
+app.use((error, req, res, next) => {
+    const status = error.status === 413 ? 413 : error.status === 400 ? 400 : 503;
+    res.status(status).json({ ok: false, valid: false, success: false, message: 'Request could not be completed.' });
 });
 
 module.exports = app;

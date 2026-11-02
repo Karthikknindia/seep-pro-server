@@ -25,6 +25,26 @@ function signature(slots) {
     const l = slots.length - p;
     return { p, l, text: [p ? `${p}P` : '', l ? `${l}L` : ''].filter(Boolean).join('_') || '0P_0L' };
 }
+function licenseFailure(lic, machineId) {
+    if (!lic) return 'Invalid license key.';
+    if (lic.status !== 'active') return 'License is not active.';
+    if (lic.expires_at && (!Number.isFinite(new Date(lic.expires_at).getTime()) || new Date(lic.expires_at) <= new Date())) return 'License has expired.';
+    if (machineId !== undefined && (!Array.isArray(lic.bound_machines) || !lic.bound_machines.some(m => m && m.machine_id === machineId))) return 'This machine is not bound to this license.';
+    return null;
+}
+function publicConfig(config = {}) {
+    const output = {};
+    for (const key of ['min_plugin_version', 'maintenance_mode', 'announcement', 'jpeg_quality']) {
+        if (['string', 'number', 'boolean'].includes(typeof config[key])) output[key] = config[key];
+    }
+    if (config.features && typeof config.features === 'object') {
+        output.features = {};
+        for (const key of ['dynamic_routing', 'candid_mode', 'max_batch_size']) {
+            if (typeof config.features[key] === 'boolean' || typeof config.features[key] === 'number') output.features[key] = config.features[key];
+        }
+    }
+    return output;
+}
 function processDecision(operation, data, config = {}) {
     if (!data || typeof data !== 'object') invalid('Missing processing input.');
     const features = config.features || {};
@@ -84,10 +104,10 @@ async function handleProcessing(req, res, getDatabase) {
     res.set('Cache-Control', 'no-store');
     try {
         const { license_key, machine_id, operation, data } = req.body || {};
-        if (typeof license_key !== 'string' || license_key.length > 100 || typeof machine_id !== 'string' || !machine_id || machine_id.length > 200) return res.status(401).json({ error: 'License and device credentials required.' });
+        if (typeof license_key !== 'string' || !license_key.trim() || license_key.length > 100 || typeof machine_id !== 'string' || !machine_id.trim() || machine_id.length > 200) return res.status(401).json({ error: 'License and device credentials required.' });
         const db = await getDatabase();
         const lic = await db.collection('licenses').findOne({ license_key });
-        if (!lic || lic.status !== 'active' || (lic.expires_at && (!Number.isFinite(new Date(lic.expires_at).getTime()) || new Date(lic.expires_at) <= new Date())) || !Array.isArray(lic.bound_machines) || !lic.bound_machines.some(m => m.machine_id === machine_id)) return res.status(403).json({ error: 'An active license bound to this device is required.' });
+        if (licenseFailure(lic, machine_id)) return res.status(403).json({ error: 'An active license bound to this device is required.' });
         const config = await db.collection('plugin_config').findOne({ _id: 'global_config' }) || {};
         if (config.maintenance_mode) return res.status(503).json({ error: 'Processing is under maintenance.' });
         return res.json({ ok: true, result: processDecision(operation, data, config) });
@@ -95,4 +115,4 @@ async function handleProcessing(req, res, getDatabase) {
         return res.status(error.status || 503).json({ error: error.status === 400 ? error.message : 'Cloud processing unavailable. Try again later.' });
     }
 }
-module.exports = { processDecision, handleProcessing };
+module.exports = { processDecision, handleProcessing, licenseFailure, publicConfig };
